@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-secrets:/etc/zookeeper/secrets
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+      - init-kafka-data
+    ports:
+      - "9092:9092"          # External access
+      - "29092:29092"        # Internal access
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT'
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    restart: unless-stopped
+  
+  init-kafka-data:
+    image: alpine
+    container_name: init-kafka-data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    entrypoint: ["sh", "-c", "chown -R 1001:1001 /var/lib/kafka/data"]
+    restart: "no"
+  
+  init-hudi-data:
+    image: alpine
+    container_name: init-hudi-data
+    volumes:
+      - hudi-data:/mnt/hudi-data
+      - ./hudi-config:/mnt/hudi-config
+    entrypoint: ["sh", "-c", "chown -R 1001:0 /mnt/hudi-data && chown -R 1001:0 /mnt/hudi-config"]
+    restart: "no"
+
+  spark-master:
+    image: bitnami/spark:3.3.0
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+      - hudi-data:/mnt/hudi-data
+    depends_on:
+      - kafka
+
+  spark-worker:
+    image: bitnami/spark:3.3.0
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+      - kafka
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+      - hudi-data:/mnt/hudi-data
+
+  data-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.data_generator
+    image: data-generator:latest
+    container_name: data-generator
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_TOPIC=test_topic
+
+  spark-app:
+    image: bitnami/spark:3.3.0
+    container_name: spark-app
+    depends_on:
+      - spark-master
+      - kafka
+    environment:
+      - SPARK_MODE=client
+    volumes:
+      - ./spark-apps:/opt/spark-apps
+      - hudi-data:/mnt/hudi-data
+      - ./hudi-config:/mnt/hudi-config
+    command: >
+      /opt/bitnami/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.apache.hudi:hudi-spark3.3-bundle_2.12:0.14.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0
+      --conf spark.serializer=org.apache.spark.serializer.KryoSerializer
+      /opt/spark-apps/spark_app.py
+    ports:
+      - "4040:4040" 
+
+volumes:
+  zookeeper-secrets:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  hudi-data:
+  hudi-config:
+
